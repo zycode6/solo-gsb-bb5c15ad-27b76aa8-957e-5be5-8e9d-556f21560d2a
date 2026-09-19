@@ -1,0 +1,44 @@
+{
+  "repository": {
+    "app": [
+      {
+        "version": "1.0.0",
+        "dependencies": [
+          {"name": "shared-lib", "specifier": ">=1.0"},
+          {"name": "shared-lib", "specifier": "<2.0", "marker": "python_version < '3.10'"},
+          {"name": "win-only", "specifier": "", "marker": "sys_platform == 'win32'"}
+        ]
+      }
+    ],
+    "shared-lib": [
+      {"version": "1.5.0"},
+      {"version": "2.0.0"}
+    ],
+    "win-only": [
+      {"version": "1.0.0"}
+    ]
+  },
+  "root": "app",
+  "specifier": "",
+  "allow_prereleases": false,
+  "target_environments": [
+    {
+      "id": "linux-py39",
+      "python_version": "3.9",
+      "sys_platform": "linux",
+      "platform_machine": "x86_64"
+    },
+    {
+      "id": "linux-py311",
+      "python_version": "3.11",
+      "sys_platform": "linux",
+      "platform_machine": "x86_64"
+    },
+    {
+      "id": "win-py39",
+      "python_version": "3.9",
+      "sys_platform": "win32",
+      "platform_machine": "AMD64"
+    }
+  ]
+}

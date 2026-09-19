@@ -10,6 +10,12 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 目标环境**：逐环境复用 `/resolve` 的全部规则求解，返回按 `id` 排序的各环境
 锁定清单，以及按包名排序的跨环境版本矩阵（每个包记录各环境版本——未出现为
 `null`——并标记 `shared` / `divergent`），用于快速定位跨平台锁定差异。
+`/lock-groups` 在同样的多环境请求上更进一步：先逐环境复用 `/resolve`
+规则求出候选锁（任一环境无解即整体 **409**，保留该环境的冲突来源），再把
+**去重后的每份候选锁在所有环境下按 `/audit-lock` 规则交叉校验**，以
+“覆盖全部环境的锁文件数量最少”为目标做**精确选择**（并列最优按锁内容及
+环境 `id` 的稳定序裁决），返回按**稳定 id** 排列的锁组、每组覆盖的环境及
+锁内容——同一输入结果确定，适合为多个目标平台生成最少的锁文件组合。
 `/audit-lock` 对现有锁定清单做**只审计、不重新求解**的自洽性检查：按锁定
 版本从根包遍历已激活依赖，报告缺失、版本不可用、约束不满足与多余的包。
 `/dependency-paths` 在审计通过的锁定清单上**解释目标包为何出现**：按锁定
@@ -64,6 +70,7 @@ docker compose up --build
 | API 根地址 | `http://localhost:8000` |
 | 解析接口 | `POST http://localhost:8000/resolve` |
 | 跨环境矩阵接口 | `POST http://localhost:8000/resolve-matrix` |
+| 锁组选择接口 | `POST http://localhost:8000/lock-groups` |
 | 升级接口 | `POST http://localhost:8000/upgrade` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
@@ -462,6 +469,86 @@ curl -s -X POST http://localhost:8000/resolve-matrix \
 | --- | --- |
 | `200` | 全部环境求解成功，返回按 `id` 排序的 `results`（各含 `root_version` 与 `locked`）与按包名排序的 `matrix` |
 | `409` | 至少一个环境无解或超过搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境的原冲突结果（单环境的 `status` 也可能为 `"limit"`） |
+| `422` | 请求/快照非法（同 `/resolve`），或环境数量不在 2～8、`id` 非法、**`id` 重复** |
+
+### `POST /lock-groups`
+
+请求体与 `/resolve-matrix` **完全一致**（`repository` / `root` / `specifier`
+/ `allow_prereleases` / 2～8 个带唯一 `id` 的 `target_environments`），回答
+的是另一个问题：**为这组目标环境生成最少的锁文件组合**。处理流程：
+
+1. **逐环境求解**：每个环境独立复用 `/resolve` 的全部规则求出候选锁
+   （marker 激活、MRV/回溯、预发布跟随语义、尝试上限）。**任一环境无解
+   即整体返回 409**（仍跑完全部环境），`failures` 按 `id` 排序保留各失败
+   环境的原冲突来源链——与 `/resolve-matrix` 的 409 逐字节同形；
+2. **候选锁去重**：不同环境求出内容完全相同的锁只保留一份；
+3. **交叉校验**：每份去重锁在**所有**环境下按 `/audit-lock` 的同一套规则
+   审计（同一快照、同一根约束、同一预发布开关，仅目标环境不同）；审计
+   通过（`valid`）即称该锁**覆盖**该环境。每个环境至少被自身求出的锁
+   覆盖，因此最小覆盖必然存在；
+4. **精确选择**：以“覆盖全部环境的锁文件数量最少”为目标枚举全部子集
+   （环境 ≤8、去重锁 ≤8，精确求解）；并列最优时按（锁内容规范化串，
+   各锁覆盖环境 `id` 元组）的稳定序取字典序最小者，同一输入结果确定。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` | 规范化（PEP 503）后的根包名 |
+| `groups` | 被选中的最少锁文件组合，**按稳定 `id` 排序**；各组覆盖环境的并集为全部环境 |
+| `groups[].id` | 锁组稳定 id：`lock-<锁内容 SHA-256 前 12 位十六进制>`；同一份锁内容恒得同一 id，与环境个数、顺序无关 |
+| `groups[].environments` | 该锁在其下按 `/audit-lock` 规则审计通过的**全部**环境 `id`，按 `id` 排序（不同锁组的覆盖环境可以重叠） |
+| `groups[].locked` | 该锁组的锁内容：规范化包名 -> 版本（按包名排序） |
+
+```bash
+curl -s -X POST http://localhost:8000/lock-groups \
+  -H 'Content-Type: application/json' \
+  -d @examples/lock-groups.json
+```
+
+示例中 `app 1.0.0` 无条件要求 `shared-lib>=1.0`，在 Python 3.9 环境下追加
+`shared-lib<2.0`，在 Windows 下追加 `win-only` 依赖。三个环境各自求解得到
+三份锁，但交叉校验发现 `linux-py39` 的锁（`shared-lib 1.5.0`）在
+`linux-py311` 下同样通过审计（`1.5.0` 满足 `>=1.0`），于是 **2 份锁即可
+覆盖 3 个环境**：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "groups": [
+    {
+      "id": "lock-6cb753148712",
+      "environments": ["win-py39"],
+      "locked": {
+        "app": "1.0.0",
+        "shared-lib": "1.5.0",
+        "win-only": "1.0.0"
+      }
+    },
+    {
+      "id": "lock-f6ad4b6309f6",
+      "environments": ["linux-py311", "linux-py39"],
+      "locked": {
+        "app": "1.0.0",
+        "shared-lib": "1.5.0"
+      }
+    }
+  ]
+}
+```
+
+反方向不成立：`linux-py311` 求出的锁（`shared-lib 2.0.0`）在 `linux-py39`
+下违反 `<2.0` 约束，`win-py39` 的锁在两个 Linux 环境下会因 `win-only`
+未激活而成为 `extraneous`——交叉校验只保留审计通过的（锁, 环境）组合。
+
+`/lock-groups` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 全部环境有解，返回按稳定 `id` 排序的最少锁组（各含覆盖环境与锁内容） |
+| `409` | 至少一个环境无解或超过搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境的原冲突结果（与 `/resolve-matrix` 的 409 同形） |
 | `422` | 请求/快照非法（同 `/resolve`），或环境数量不在 2～8、`id` 非法、**`id` 重复** |
 
 ### `POST /upgrade`
@@ -1345,6 +1432,16 @@ curl -s -X POST http://localhost:8000/explain-version \
     列表均按包名排序）；不可行时返回 409，复用第 2～8 条的约束来源链
     说明阻塞原因，钉版本约束本身作为一条根级来源链出现。两次求解各自
     使用独立的求解器实例，互不影响冲突收集与尝试计数。
+17. **锁组选择（`/lock-groups`）**：请求与第 12 条相同。先逐环境复用
+    第 2～8 条的同一套求解求出候选锁（任一环境无解即整体 409，保留各
+    失败环境的原冲突来源），内容相同的候选锁去重；随后每份去重锁在
+    所有环境下复用第 10 条的审计规则交叉校验，审计通过即覆盖该环境
+    （每个环境至少被自身求出的锁覆盖，最小覆盖必然存在）。以“覆盖全部
+    环境的锁文件数量最少”为目标精确枚举全部子集（锁 ≤8 份，规模
+    ≤ 2^8）；并列最优时按（锁内容规范化串, 各锁覆盖环境 id 元组）的
+    稳定序取字典序最小者。响应按稳定 id（锁内容 SHA-256 派生）排列
+    锁组，每组给出其审计通过的全部环境 id（按 id 排序，组间可重叠）
+    与锁内容；同一输入结果确定，与环境提交顺序无关。
 
 ### 安全护栏
 
@@ -1364,10 +1461,11 @@ app/
   spdx.py           # SPDX 许可证表达式词法/递归下降解析与 allow/deny 三态求值
   license_policy.py # 有效锁图上的逐包许可证策略判定（违规/未知 + 全部最短路径）
   lock_diff.py      # 两份有效锁的根可达包差异（added/removed/upgraded/downgraded + 双侧最短路径）
+  lock_groups.py    # 跨环境候选锁去重、稳定 id 与“最少锁文件覆盖全部环境”的精确选择
   repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py        # 请求/响应模型
-examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff、/explain-version 示例）
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/lock-groups、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff、/explain-version 示例）
 tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

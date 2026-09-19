@@ -7,6 +7,12 @@
   规则求解，全部成功时返回按 id 排序的各环境 locked 与按包名排序的跨环境
   版本矩阵（shared/divergent）；任一环境无解则整体 409，列出各失败环境的
   原冲突结果
+* POST /lock-groups
+  同 /resolve-matrix 的请求：先逐环境复用 /resolve 规则求出候选锁（任一
+  环境无解整体 409，保留该环境冲突来源），再把去重后的每份候选锁在所有
+  环境下按 /audit-lock 规则交叉校验，以“覆盖全部环境的锁文件数量最少”
+  为目标做精确选择（并列最优按锁内容及环境 id 的稳定序裁决）；成功时
+  返回按稳定 id 排列的锁组、每组覆盖环境及锁内容，同一输入结果确定
 * POST /upgrade     在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
@@ -50,8 +56,10 @@ from packaging.version import Version
 from .audit import audit_lock
 from .license_policy import evaluate_license_policy
 from .lock_diff import diff_locks
+from .lock_groups import canonical_lock_key, lock_group_id, select_minimum_cover
 from .paths import build_locked_graph, shortest_paths
 from .repository import (
+    Repository,
     SnapshotError,
     build_repository,
     canonical,
@@ -75,6 +83,8 @@ from .schemas import (
     LockDiffInvalidResponse,
     LockDiffRequest,
     LockDiffResponse,
+    LockGroupsRequest,
+    LockGroupsResponse,
     ResolveMatrixRequest,
     ResolveMatrixResponse,
     MatrixUnresolvedResponse,
@@ -95,7 +105,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -134,6 +144,31 @@ def healthz() -> dict:
     return {"status": "ok"}
 
 
+def _resolve_repo(
+    repo: Repository,
+    *,
+    root_canonical: str,
+    specifier: str,
+    allow_prereleases: bool,
+) -> tuple[dict | None, dict | None]:
+    """在已构建的 Repository 上按 /resolve 的既有规则求解一次。
+
+    返回 ``(ok_payload, conflict_payload)``，二者恰有一个非 None：
+    成功为 build_output 的 200 响应体，无解或超上限为 409 响应体。
+    """
+    root_spec = parse_root_specifier(specifier)
+
+    resolver = Resolver(repo, allow_prereleases=allow_prereleases)
+    try:
+        state = resolver.resolve(root_canonical, root_spec, specifier)
+    except ResolutionLimit:
+        return None, _conflict_payload(resolver.build_conflicts(limit=True))
+
+    if state is not None:
+        return resolver.build_output(state, root_canonical), None
+    return None, _conflict_payload(resolver.build_conflicts())
+
+
 def _resolve_once(
     *,
     repository_payload: dict,
@@ -152,17 +187,12 @@ def _resolve_once(
     快照/约束构造期的 SnapshotError 不在此捕获，由调用方映射为 422。
     """
     repo = build_repository(repository_payload, target_environment)
-    root_spec = parse_root_specifier(specifier)
-
-    resolver = Resolver(repo, allow_prereleases=allow_prereleases)
-    try:
-        state = resolver.resolve(root_canonical, root_spec, specifier)
-    except ResolutionLimit:
-        return None, _conflict_payload(resolver.build_conflicts(limit=True))
-
-    if state is not None:
-        return resolver.build_output(state, root_canonical), None
-    return None, _conflict_payload(resolver.build_conflicts())
+    return _resolve_repo(
+        repo,
+        root_canonical=root_canonical,
+        specifier=specifier,
+        allow_prereleases=allow_prereleases,
+    )
 
 
 @app.post(
@@ -338,6 +368,138 @@ def resolve_matrix(request: ResolveMatrixRequest):
         "results": results,
         "matrix": matrix,
     }
+
+
+@app.post(
+    "/lock-groups",
+    summary="跨环境求解后精确选出覆盖全部环境的最少锁文件组合",
+    response_model=LockGroupsResponse,
+    responses={
+        409: {
+            "model": MatrixUnresolvedResponse,
+            "description": "任一目标环境无解：列出各失败环境的原冲突结果",
+        },
+        422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含重复 id）"},
+    },
+)
+def lock_groups(request: LockGroupsRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    # id 唯一性在路由层校验（同 /resolve-matrix）：重复值返回 422，不进入求解。
+    seen: set[str] = set()
+    for env in request.target_environments:
+        if env.id in seen:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "invalid_snapshot",
+                    "message": f"target_environments 的 id {env.id!r} 重复，必须唯一",
+                },
+            )
+        seen.add(env.id)
+
+    # marker 解析/求值与根约束非法属于 422；根包只查一次（与环境无关）。
+    try:
+        repo_known = build_repository(
+            payload["repository"], payload["target_environments"][0]
+        )
+        root_spec = parse_root_specifier(request.specifier)
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo_known.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 逐环境构建仓库（环境值非法在此报 422）并复用 /resolve 规则求解；
+    # 即使某环境已无解也继续跑完全部环境，以便 409 列出所有失败环境。
+    repos: dict[str, Repository] = {}
+    resolved_locks: dict[str, dict[str, str]] = {}
+    failures: list[dict] = []
+    for env in payload["target_environments"]:
+        env_id = env["id"]
+        try:
+            repo = build_repository(payload["repository"], env)
+        except SnapshotError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "invalid_snapshot", "message": str(exc)},
+            )
+        repos[env_id] = repo
+        ok, conflict = _resolve_repo(
+            repo,
+            root_canonical=root_canonical,
+            specifier=request.specifier,
+            allow_prereleases=request.allow_prereleases,
+        )
+        if ok is not None:
+            resolved_locks[env_id] = ok["locked"]
+        else:
+            assert conflict is not None
+            failures.append({"id": env_id, **conflict})
+
+    if failures:
+        failures.sort(key=lambda f: f["id"])
+        ids = "、".join(f["id"] for f in failures)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "conflict",
+                "message": (
+                    f"{len(failures)} 个目标环境无解（共 "
+                    f"{len(request.target_environments)} 个）：{ids}"
+                ),
+                "failures": failures,
+            },
+        )
+
+    # 候选锁按内容去重：不同环境可能求出完全相同的锁，只交叉校验一次。
+    unique_locks: dict[str, dict[str, str]] = {}
+    for env_id in sorted(resolved_locks):
+        locked = resolved_locks[env_id]
+        unique_locks.setdefault(canonical_lock_key(locked), locked)
+
+    # 交叉校验：每份去重锁在每个环境下都按 /audit-lock 的同一套规则审计
+    # （同一快照、同一根约束、同一预发布开关，仅目标环境不同）；通过审计
+    # （valid）即称该锁覆盖该环境。每个环境至少被自身求出的锁覆盖。
+    coverage: dict[str, set[str]] = {key: set() for key in unique_locks}
+    for key, locked in unique_locks.items():
+        parsed_lock = parse_current_lock(locked)
+        for env_id, repo in repos.items():
+            result = audit_lock(
+                repo,
+                root_name=root_canonical,
+                root_spec=root_spec,
+                root_raw=request.specifier,
+                current_lock=parsed_lock,
+                allow_prereleases=request.allow_prereleases,
+            )
+            if result["valid"]:
+                coverage[key].add(env_id)
+
+    # 精确选择：覆盖全部环境的锁文件数量最少；并列最优按锁内容及环境 id
+    # 的稳定序裁决（见 lock_groups.select_minimum_cover）。
+    selected = select_minimum_cover(coverage, set(resolved_locks))
+
+    groups = [
+        {
+            "id": lock_group_id(unique_locks[key]),
+            "environments": sorted(coverage[key]),
+            "locked": unique_locks[key],
+        }
+        for key in selected
+    ]
+    groups.sort(key=lambda group: group["id"])
+    return {"status": "ok", "root": root_canonical, "groups": groups}
 
 
 def _lock_changes(

@@ -181,6 +181,17 @@ class ResolveMatrixRequest(_ResolveInputs):
     )
 
 
+class LockGroupsRequest(ResolveMatrixRequest):
+    """POST /lock-groups 的请求体：字段与 /resolve-matrix 完全一致。
+
+    同一份快照 + 根约束 + 2～8 个带唯一 id 的目标环境：先逐环境复用
+    /resolve 规则求出候选锁，再把去重后的候选锁在所有环境下按
+    /audit-lock 规则交叉校验，精确选出覆盖全部环境的最少锁文件组合。
+    """
+
+    model_config = {"extra": "forbid"}
+
+
 class UpgradeRequest(ResolveRequest):
     """POST /upgrade 的请求体：在 /resolve 全部字段上附加当前锁定清单与升级目标。"""
 
@@ -515,6 +526,49 @@ class MatrixUnresolvedResponse(BaseModel):
     status: Literal["conflict"]
     message: str
     failures: list[MatrixFailureOut]
+
+
+# --------------------------------------------------------------------- #
+# POST /lock-groups 响应
+# --------------------------------------------------------------------- #
+class LockGroupOut(BaseModel):
+    """一个锁组：一份被选中锁文件的稳定 id、覆盖环境与锁内容。"""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(
+        ...,
+        description=(
+            "锁组稳定 id：lock-<锁内容 SHA-256 前 12 位十六进制>；"
+            "同一份锁内容恒得同一 id，与环境个数、顺序无关。"
+        ),
+    )
+    environments: list[str] = Field(
+        ...,
+        description=(
+            "该锁在其下按 /audit-lock 规则审计通过（valid）的全部环境 id，"
+            "按 id 排序；覆盖全部环境的并集即全部环境。"
+        ),
+    )
+    locked: dict[str, str] = Field(
+        ..., description="该锁组的锁内容：规范化包名 -> 版本（按包名排序）。"
+    )
+
+
+class LockGroupsResponse(BaseModel):
+    """全部环境有解且完成最小覆盖选择时的锁组结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    groups: list[LockGroupOut] = Field(
+        ...,
+        description=(
+            "覆盖全部环境的最少锁文件组合，按稳定 id 排序；"
+            "各组覆盖环境的并集为全部环境。"
+        ),
+    )
 
 
 # --------------------------------------------------------------------- #
